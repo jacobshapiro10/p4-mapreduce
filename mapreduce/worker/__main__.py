@@ -5,6 +5,7 @@ import json
 import time
 import click
 import mapreduce.utils
+import socket
 
 
 # Configure logging
@@ -23,19 +24,15 @@ class Worker:
             "manager_host=%s manager_port=%s",
             manager_host, manager_port,
         )
-
-        # This is a fake message to demonstrate pretty printing with logging
-        message_dict = {
-            "message_type": "register_ack",
-            "worker_host": "localhost",
-            "worker_port": 6001,
-        }
-        LOGGER.debug("TCP recv\n%s", json.dumps(message_dict, indent=2))
-
-        # TODO: you should remove this. This is just so the program doesn't
-        # exit immediately!
-        LOGGER.debug("IMPLEMENT ME!")
-        time.sleep(120)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect((manager_host, manager_port))
+            message = json.dumps({
+                "message_type": "register",
+                "worker_host": host,
+                "worker_port": port,
+            })
+            sock.sendall(message.encode('utf-8'))
+            LOGGER.info("Sent register message to Manager")
 
 
 @click.command()
