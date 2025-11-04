@@ -21,19 +21,15 @@ class Worker:
         self.manager_port = manager_port
         """Construct a Worker instance and start listening for messages."""
 
-        LOGGER.info(
-            "Starting worker host=%s port=%s pwd=%s",
-            host, port, os.getcwd(),
-        )
-        LOGGER.info(
-            "manager_host=%s manager_port=%s",
-            manager_host, manager_port,
-        )
+        LOGGER.info("Worker host=%s port=%s manager_host=%s, manager_port=%s pwd=%s", host, port, manager_host, manager_port, os.getcwd())
+
+        
 
         listen_thread = threading.Thread(target=self.listen_for_messages, args=(host, port))
         listen_thread.start()
 
         self.register_with_manager(manager_host, manager_port, host, port)
+        
 
         # Wait for listener thread to finish (never does, until shutdown)
         listen_thread.join()
@@ -42,18 +38,23 @@ class Worker:
     def listen_for_messages(self, host, port):
         """Listen for TCP messages sent by the Manager."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            LOGGER.info("Start TCP server thread")
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
+            LOGGER.debug(f"TCP bind {host}:{port}")
             sock.listen()
             sock.settimeout(1)
 
-            LOGGER.info("Listening on TCP port %s", port)
-
             while True:
+                
                 try:
+                    
                     clientsocket, address = sock.accept()
+                    
                 except socket.timeout:
+                    
                     continue
+                   
 
                 with clientsocket:
                     clientsocket.settimeout(1)
@@ -78,14 +79,21 @@ class Worker:
                     except json.JSONDecodeError:
                         continue
 
-                    LOGGER.info("Received message: %s", message_dict)
+                    LOGGER.debug("TCP recv\n%s", json.dumps(message_dict, indent=4))
                     if message_dict.get("message_type") == "register_ack":
+                        LOGGER.debug("Got register_ack RegisterAckMessage()")   
+                        LOGGER.info(f"Connected to Manager {self.manager_host}:{self.manager_port}")    
                         heartbeat_thread = threading.Thread(
                             target=self.send_heartbeats,
-                            args=(manager_host, manager_port, host, port)
+                            args=(self.manager_host, self.manager_port, host, port)
                         )
+                        LOGGER.info("Start heartbeat thread")
+
                         heartbeat_thread.daemon = True  # allows clean shutdown
                         heartbeat_thread.start()
+                        
+                        
+
 
 
 
@@ -103,13 +111,16 @@ class Worker:
                 LOGGER.error("Could not connect to Manager at %s:%s", manager_host, manager_port)
                 return
 
-            message = json.dumps({
+            message_dict = {
                 "message_type": "register",
                 "worker_host": host,
                 "worker_port": port,
-            })
-            sock.sendall(message.encode("utf-8"))
-            LOGGER.info("Sent register message to Manager")
+            }
+            LOGGER.debug(f"TCP send to {manager_host}:{manager_port}\n%s", json.dumps(message_dict, indent=4))
+
+            sock.sendall(json.dumps(message_dict).encode("utf-8"))     
+            LOGGER.info(f"Sent connection request to Manager {manager_host}:{manager_port}")
+
 
    
     def send_heartbeats(self, manager_host, manager_port, host, port):
@@ -117,17 +128,19 @@ class Worker:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(1)
             while True:
-                message = json.dumps({
+                message = {
                     "message_type": "heartbeat",
                     "worker_host": host,
                     "worker_port": port,
-                })
+                }
                 try:
-                    sock.sendto(message.encode("utf-8"), (manager_host, manager_port))
+                    sock.sendto(json.dumps(message).encode("utf-8"), (manager_host, manager_port))
                 except OSError:
                     # Manager might be down — just try again later
                     continue
-                LOGGER.debug("Sent heartbeat to Manager")
+                
+                LOGGER.debug(f"UDP sent to {manager_host}:{manager_port}\n%s", json.dumps(message, indent=4))
+
                 time.sleep(2)
 
 

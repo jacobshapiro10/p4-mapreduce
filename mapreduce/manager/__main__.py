@@ -3,16 +3,13 @@ import os
 import tempfile
 import logging
 import json
-import time
 import click
 import socket
-import mapreduce.utils
 import threading
-
+import mapreduce.utils
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
-
 
 class Manager:
     """Represent a MapReduce framework Manager node."""
@@ -20,64 +17,43 @@ class Manager:
     def __init__(self, host, port):
         """Construct a Manager instance and start listening for messages."""
 
-        LOGGER.info(
-            "Starting manager host=%s port=%s pwd=%s",
-            host, port, os.getcwd(),
-        )
+        LOGGER.info("Manager host=%s port=%s pwd=%s", host, port, os.getcwd())
 
-        prefix = f"mapreduce-shared-"
+        prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
             LOGGER.info("Created tmpdir %s", tmpdir)
 
-            udp_thread = threading.Thread(target=self.udp_delegate, args=(host, port))            
+            LOGGER.info("Start UDP server thread")
+            udp_thread = threading.Thread(target=self.udp_delegate, args=(host, port))
             udp_thread.start()
-            self.tcp_delegate(host, port)            
+
+            LOGGER.info("Start TCP server thread")
+            self.tcp_delegate(host, port)
+
             udp_thread.join()
-
-        LOGGER.info("Cleaned up tmpdir %s", tmpdir)
-
-
-
+            LOGGER.info("Cleaned up tmpdir %s", tmpdir)
 
     def tcp_delegate(self, host, port):
-        #create socket that will clean up when done
+        """Listen for TCP connections (e.g., Worker registration)."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-
-            #rerun program immediatly without waiting for OS to release the port
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            #Recieve messages sent to host and port
             sock.bind((host, port))
-            sock.listen() #listen to message from client
-
-            # Socket accept() will block for a maximum of 1 second.  If you
-            # omit this, it blocks indefinitely, waiting for a connection.
+            LOGGER.debug(f"TCP bind {host}:{port}")
+            sock.listen()
             sock.settimeout(1)
 
             while True:
-                # Wait for a connection for 1s.  The socket library avoids consuming
-                # CPU while waiting for a connection.
                 try:
-                    clientsocket, address = sock.accept() #accept message from client
+                    clientsocket, address = sock.accept()
                 except socket.timeout:
                     continue
-                LOGGER.info("Connection from", address[0])
 
-                # Socket recv() will block for a maximum of 1 second.  If you omit
-                # this, it blocks indefinitely, waiting for packets.
-                clientsocket.settimeout(1)
                 
-
-                # Receive data, one chunk at a time.  If recv() times out before we
-                # can read a chunk, then go back to the top of the loop and try
-                # again.  When the client closes the connection, recv() returns
-                # empty data, which breaks out of the loop.  We make a simplifying
-                # assumption that the client will always cleanly close the
-                # connection.
                 with clientsocket:
+                    clientsocket.settimeout(1)
                     message_chunks = []
                     while True:
                         try:
-                            #read the message
                             data = clientsocket.recv(4096)
                         except socket.timeout:
                             continue
@@ -85,57 +61,64 @@ class Manager:
                             break
                         message_chunks.append(data)
 
-                # Decode list-of-byte-strings to UTF8 and parse JSON data
-                message_bytes = b''.join(message_chunks)
-                message_str = message_bytes.decode("utf-8")
+                    if not message_chunks:
+                        continue
 
-                try:
-                    message_dict = json.loads(message_str)
-                except json.JSONDecodeError:
-                    continue
-                LOGGER.info(message_dict)
-                if message_dict.get("message_type") == "register":
-                    worker_host = message_dict.get("worker_host")
-                    worker_port = message_dict.get("worker_port")
+                    message_bytes = b"".join(message_chunks)
+                    message_str = message_bytes.decode("utf-8")
+
                     try:
-                        sock.connect((worker_host, worker_port))
-                    except ConnectionRefusedError:
-                        LOGGER.error("Could not connect to Worker at %s:%s", worker_host, worker_port)
-                        return
-                    
-                    message = json.dumps({
-                        "message_type": "register_ack",
-                        "manager_host": host,
-                        "worker_port": port,
-                    })
-                    sock.sendall(message.encode("utf-8"))
-                    LOGGER.info("Sent register message to Worker")
+                        message_dict = json.loads(message_str)
+                    except json.JSONDecodeError:
+                        continue
+
                 
+                    LOGGER.debug("TCP recv\n%s", json.dumps(message_dict, indent=4))
+
+
+                    if message_dict.get("message_type") == "register":
+                        worker_host = message_dict["worker_host"]
+                        worker_port = message_dict["worker_port"]
+
+                        ack = {
+                            "message_type": "register_ack",
+                            "manager_host": host,
+                            "manager_port": port,
+                        }
+
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
+                            try:
+                                reply_sock.connect((worker_host, worker_port))
+                                reply_sock.sendall(json.dumps(ack).encode("utf-8"))
+                                LOGGER.debug(f"TCP send to {worker_host}:{worker_port}\n%s", json.dumps(ack, indent=4))
+                            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                                LOGGER.debug("Hi")
+
+                        LOGGER.info(f"Registered Worker RemoteWorker('{worker_host}', {worker_port})")
 
     def udp_delegate(self, host, port):
-            # Create an INET, DGRAM socket, this is UDP
+        """Listen for UDP heartbeat messages."""
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-
-            # Bind the UDP socket to the server
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
+            LOGGER.debug(f"UDP bind {host}:{port}")
             sock.settimeout(1)
 
-            # No sock.listen() since UDP doesn't establish connections like TCP
-
-            # Receive incoming UDP messages
             while True:
                 try:
                     message_bytes = sock.recv(4096)
                 except socket.timeout:
                     continue
+
                 message_str = message_bytes.decode("utf-8")
                 try:
                     message_dict = json.loads(message_str)
                 except json.JSONDecodeError:
                     continue
 
-                LOGGER.info(message_dict)
+                
+                LOGGER.debug("UDP recv\n%s", json.dumps(message_dict, indent=4))
+
 
 
 @click.command()
@@ -159,7 +142,6 @@ def main(host, port, logfile, loglevel, shared_dir):
     root_logger.addHandler(handler)
     root_logger.setLevel(loglevel.upper())
     Manager(host, port)
-
 
 if __name__ == "__main__":
     main()
