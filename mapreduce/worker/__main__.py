@@ -4,8 +4,9 @@ import logging
 import json
 import time
 import click
-import mapreduce.utils
 import socket
+import threading
+import mapreduce.utils
 
 
 # Configure logging
@@ -14,8 +15,12 @@ LOGGER = logging.getLogger(__name__)
 
 class Worker:
     """A class representing a Worker node in a MapReduce cluster."""
+
     def __init__(self, host, port, manager_host, manager_port):
+        self.manager_host = manager_host
+        self.manager_port = manager_port
         """Construct a Worker instance and start listening for messages."""
+
         LOGGER.info(
             "Starting worker host=%s port=%s pwd=%s",
             host, port, os.getcwd(),
@@ -24,15 +29,106 @@ class Worker:
             "manager_host=%s manager_port=%s",
             manager_host, manager_port,
         )
+
+        listen_thread = threading.Thread(target=self.listen_for_messages, args=(host, port))
+        listen_thread.start()
+
+        self.register_with_manager(manager_host, manager_port, host, port)
+
+        # Wait for listener thread to finish (never does, until shutdown)
+        listen_thread.join()
+
+  
+    def listen_for_messages(self, host, port):
+        """Listen for TCP messages sent by the Manager."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.connect((manager_host, manager_port))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen()
+            sock.settimeout(1)
+
+            LOGGER.info("Listening on TCP port %s", port)
+
+            while True:
+                try:
+                    clientsocket, address = sock.accept()
+                except socket.timeout:
+                    continue
+
+                with clientsocket:
+                    clientsocket.settimeout(1)
+                    message_chunks = []
+                    while True:
+                        try:
+                            data = clientsocket.recv(4096)
+                        except socket.timeout:
+                            continue
+                        if not data:
+                            break
+                        message_chunks.append(data)
+
+                    if not message_chunks:
+                        continue
+
+                    message_bytes = b''.join(message_chunks)
+                    message_str = message_bytes.decode("utf-8")
+
+                    try:
+                        message_dict = json.loads(message_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    LOGGER.info("Received message: %s", message_dict)
+                    if message_dict.get("message_type") == "register_ack":
+                        heartbeat_thread = threading.Thread(
+                            target=self.send_heartbeats,
+                            args=(manager_host, manager_port, host, port)
+                        )
+                        heartbeat_thread.daemon = True  # allows clean shutdown
+                        heartbeat_thread.start()
+
+
+
+                    if message_dict.get("message_type") == "shutdown":
+                        LOGGER.info("Shutdown signal received. Exiting Worker.")
+                        return  # Exit thread cleanly
+
+ 
+    def register_with_manager(self, manager_host, manager_port, host, port):
+        """Send a registration message to the Manager via TCP."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.connect((manager_host, manager_port))
+            except ConnectionRefusedError:
+                LOGGER.error("Could not connect to Manager at %s:%s", manager_host, manager_port)
+                return
+
             message = json.dumps({
                 "message_type": "register",
                 "worker_host": host,
                 "worker_port": port,
             })
-            sock.sendall(message.encode('utf-8'))
+            sock.sendall(message.encode("utf-8"))
             LOGGER.info("Sent register message to Manager")
+
+   
+    def send_heartbeats(self, manager_host, manager_port, host, port):
+        """Send heartbeat messages to Manager every 2 seconds via UDP."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1)
+            while True:
+                message = json.dumps({
+                    "message_type": "heartbeat",
+                    "worker_host": host,
+                    "worker_port": port,
+                })
+                try:
+                    sock.sendto(message.encode("utf-8"), (manager_host, manager_port))
+                except OSError:
+                    # Manager might be down — just try again later
+                    continue
+                LOGGER.debug("Sent heartbeat to Manager")
+                time.sleep(2)
 
 
 @click.command()
