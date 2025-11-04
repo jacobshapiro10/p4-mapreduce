@@ -94,8 +94,23 @@ class Manager:
                 except json.JSONDecodeError:
                     continue
                 LOGGER.info(message_dict)
-
-
+                if message_dict.get("message_type") == "register":
+                    worker_host = message_dict.get("worker_host")
+                    worker_port = message_dict.get("worker_port")
+                    try:
+                        sock.connect((worker_host, worker_port))
+                    except ConnectionRefusedError:
+                        LOGGER.error("Could not connect to Worker at %s:%s", worker_host, worker_port)
+                        return
+                    
+                    message = json.dumps({
+                        "message_type": "register_ack",
+                        "manager_host": host,
+                        "worker_port": port,
+                    })
+                    sock.sendall(message.encode("utf-8"))
+                    LOGGER.info("Sent register message to Worker")
+                
 
     def udp_delegate(self, host, port):
             # Create an INET, DGRAM socket, this is UDP
@@ -115,7 +130,11 @@ class Manager:
                 except socket.timeout:
                     continue
                 message_str = message_bytes.decode("utf-8")
-                message_dict = json.loads(message_str)
+                try:
+                    message_dict = json.loads(message_str)
+                except json.JSONDecodeError:
+                    continue
+
                 LOGGER.info(message_dict)
 
 
