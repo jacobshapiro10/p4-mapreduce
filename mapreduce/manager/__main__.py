@@ -7,6 +7,7 @@ import click
 import socket
 import threading
 import mapreduce.utils
+import sys
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
@@ -27,10 +28,12 @@ class Manager:
 
             LOGGER.info("Start UDP server thread")
             udp_thread = threading.Thread(target=self.udp_delegate, args=(host, port))
+            udp_thread.daemon = True
             udp_thread.start()
 
             LOGGER.info("Start TCP server thread")
             self.tcp_delegate(host, port)
+            
 
             udp_thread.join()
             LOGGER.info("Cleaned up tmpdir %s", tmpdir)
@@ -112,7 +115,8 @@ class Manager:
                                     LOGGER.debug(f"Could not contact worker {worker_host}:{worker_port}")
 
                         # Exit tcp_delegate → causes Manager to end
-                        return
+                        sys.exit(0)
+                        
                                             
 
     def udp_delegate(self, host, port):

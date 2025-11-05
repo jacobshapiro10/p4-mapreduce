@@ -94,8 +94,7 @@ class Worker:
 
                     if message_dict.get("message_type") == "shutdown":
                         LOGGER.info("Shutdown signal received. Exiting Worker.")
-                        return  # Exit thread cleanly
-
+                        return
  
     def register_with_manager(self, manager_host, manager_port, host, port):
         """Send a registration message to the Manager via TCP."""
