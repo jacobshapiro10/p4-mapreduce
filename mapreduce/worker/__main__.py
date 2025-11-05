@@ -91,11 +91,6 @@ class Worker:
 
                         heartbeat_thread.daemon = True  # allows clean shutdown
                         heartbeat_thread.start()
-                        
-                        
-
-
-
 
                     if message_dict.get("message_type") == "shutdown":
                         LOGGER.info("Shutdown signal received. Exiting Worker.")

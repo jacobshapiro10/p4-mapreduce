@@ -15,6 +15,8 @@ class Manager:
     """Represent a MapReduce framework Manager node."""
 
     def __init__(self, host, port):
+
+        self.workers = []
         """Construct a Manager instance and start listening for messages."""
 
         LOGGER.info("Manager host=%s port=%s pwd=%s", host, port, os.getcwd())
@@ -95,6 +97,23 @@ class Manager:
                                 LOGGER.debug("Hi")
 
                         LOGGER.info(f"Registered Worker RemoteWorker('{worker_host}', {worker_port})")
+                        self.workers.append((worker_host, worker_port))
+
+
+                    elif message_dict.get("message_type") == "shutdown":
+                        for worker_host, worker_port in self.workers:
+                            shutdown_msg = {"message_type": "shutdown"}
+                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
+                                try:
+                                    reply_sock.connect((worker_host, worker_port))
+                                    reply_sock.sendall(json.dumps(shutdown_msg).encode("utf-8"))
+                                    LOGGER.debug(f"Sent shutdown to {worker_host}:{worker_port}")
+                                except OSError:
+                                    LOGGER.debug(f"Could not contact worker {worker_host}:{worker_port}")
+
+                        # Exit tcp_delegate → causes Manager to end
+                        return
+                                            
 
     def udp_delegate(self, host, port):
         """Listen for UDP heartbeat messages."""
