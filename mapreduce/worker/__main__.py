@@ -19,6 +19,7 @@ class Worker:
     def __init__(self, host, port, manager_host, manager_port):
         self.manager_host = manager_host
         self.manager_port = manager_port
+        self.shutdown_flag = threading.Event()  
         """Construct a Worker instance and start listening for messages."""
 
         LOGGER.info("Worker host=%s port=%s manager_host=%s, manager_port=%s pwd=%s", host, port, manager_host, manager_port, os.getcwd())
@@ -26,6 +27,7 @@ class Worker:
         
 
         listen_thread = threading.Thread(target=self.listen_for_messages, args=(host, port))
+        listen_thread.daemon = True
         listen_thread.start()
 
         self.register_with_manager(manager_host, manager_port, host, port)
@@ -45,7 +47,7 @@ class Worker:
             sock.listen()
             sock.settimeout(1)
 
-            while True:
+            while not self.shutdown_flag.is_set():
                 
                 try:
                     
@@ -93,8 +95,10 @@ class Worker:
                         heartbeat_thread.start()
 
                     if message_dict.get("message_type") == "shutdown":
+                        self.shutdown_flag.set()
                         LOGGER.info("Shutdown signal received. Exiting Worker.")
                         return
+                        
  
     def register_with_manager(self, manager_host, manager_port, host, port):
         """Send a registration message to the Manager via TCP."""
@@ -121,7 +125,7 @@ class Worker:
         """Send heartbeat messages to Manager every 2 seconds via UDP."""
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(1)
-            while True:
+            while not self.shutdown_flag.is_set():
                 message = {
                     "message_type": "heartbeat",
                     "worker_host": host,
@@ -135,7 +139,7 @@ class Worker:
                 
                 LOGGER.debug(f"UDP sent to {manager_host}:{manager_port}\n%s", json.dumps(message, indent=4))
 
-                time.sleep(2)
+                self.shutdown_flag.wait(2)
 
 
 @click.command()
