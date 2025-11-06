@@ -10,6 +10,7 @@ import mapreduce.utils
 import sys
 from queue import Queue
 import shutil
+import time
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ class Manager:
         self.shutdown_flag = False
 
 
-        self.workers = []
+        self.workers = {}
         """Construct a Manager instance and start listening for messages."""
 
         LOGGER.info("Manager host=%s port=%s pwd=%s", host, port, os.getcwd())
@@ -38,6 +39,9 @@ class Manager:
 
             LOGGER.info("Start TCP server thread")
             self.tcp_delegate(host, port, tmpdir)
+
+            moniter_thread = threading.Thread(target=self.dead_worker_monitor, daemon=True)
+            moniter_thread.start()
             
 
             udp_thread.join()
@@ -100,8 +104,6 @@ class Manager:
 
                         ack = {
                             "message_type": "register_ack",
-                            "manager_host": host,
-                            "manager_port": port,
                         }
 
                         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
@@ -113,7 +115,7 @@ class Manager:
                                 LOGGER.debug("Hi")
 
                         LOGGER.info(f"Registered Worker RemoteWorker('{worker_host}', {worker_port})")
-                        self.workers.append((worker_host, worker_port))
+                        self.workers[(worker_host, worker_port)] = {"state": "ready", "last_hb": time.time()}
 
 
                     elif message_dict.get("message_type") == "shutdown":
@@ -171,6 +173,12 @@ class Manager:
                     message_dict = json.loads(message_str)
                 except json.JSONDecodeError:
                     continue
+                if message_str.get("message_type") == "heartbeat":
+                    wh = message_dict["worker_host"]
+                    wp = message_dict["worker_port"]
+                    key = (wh, wp)
+                    if key in self.workers:
+                        self.workers[key]["last_hb"] = time.time()
 
                 
                 LOGGER.debug("UDP recv\n%s", json.dumps(message_dict, indent=4))
@@ -195,9 +203,90 @@ class Manager:
 
 
 
+        files = os.listdir(input_dir)
+        files = sorted(files)
+
+
+        partitions = [[] for _ in range(num_mappers)]
+
+    
+        for idx, filename in enumerate(files):
+            partitions[idx % num_mappers].append(os.path.join(input_dir, filename))
+
+        
+
+
+
+        from collections import deque
+
+        self.pending_map_tasks = deque(range(num_mappers))   
+        self.in_progress = {}                               
+        self.remaining_maps = num_mappers
+        self.partitions = partitions
+        self.job_dir = job_dir
+        self.mapper_exe = mapper_exe
+        self.num_reducers = num_reducers
+
+        for key, w in self.workers.items():
+            if w["state"] == "ready":
+                self._assign_map_task_to_worker(key)
+
+
+
+
+
         #handle rest of code
 
         self.active_job_indicator = False
+
+
+
+
+
+    def _assign_map_task_to_worker(self, key):
+        
+        if not self.pending_map_tasks:
+            return
+        task_id = self.pending_map_tasks.popleft()
+        wh, wp = key
+
+        message = {
+            "message_type": "new_map_task",
+            "task_id": task_id,
+            "input_paths": self.partitions[task_id],
+            "executable": self.mapper_exe,
+            "output_directory": self.job_dir,
+            "num_partitions": self.num_reducers,
+        }
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((wh, wp))
+                s.sendall(json.dumps(message).encode("utf-8"))
+            self.workers[key]["state"] = "busy"
+            self.in_progress[key] = task_id
+            LOGGER.info(f"Assigned MapTask({task_id}) → Worker({wh},{wp})")
+        except OSError:
+            LOGGER.warning(f"Worker {key} unreachable, marking dead.")
+            self.workers[key]["state"] = "dead"
+            self.pending_map_tasks.appendleft(task_id)
+
+
+    def dead_worker_monitor(self):
+        import time
+        TIMEOUT = 6
+        while not self.shutdown_flag:
+            now = time.time()
+            for key, worker in list(self.workers.items()):
+                if worker["state"] != "dead" and now - worker["last_hb"] > TIMEOUT:
+                    LOGGER.warning(f"Worker {key} is dead")
+                    worker["state"] = "dead"
+                    # If this worker was processing a map task, requeue it:
+                    if key in self.in_progress:
+                        task_id = self.in_progress.pop(key)
+                        self.pending_map_tasks.appendleft(task_id)
+            time.sleep(1)
+
 
 
 
