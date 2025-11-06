@@ -8,14 +8,19 @@ import socket
 import threading
 import mapreduce.utils
 import sys
+from queue import Queue
+import shutil
 
-# Configure logging
+
 LOGGER = logging.getLogger(__name__)
 
 class Manager:
     """Represent a MapReduce framework Manager node."""
 
     def __init__(self, host, port):
+        self.active_job_indicator = False
+        self.shutdown_flag = False
+
 
         self.workers = []
         """Construct a Manager instance and start listening for messages."""
@@ -32,22 +37,30 @@ class Manager:
             udp_thread.start()
 
             LOGGER.info("Start TCP server thread")
-            self.tcp_delegate(host, port)
+            self.tcp_delegate(host, port, tmpdir)
             
 
             udp_thread.join()
             LOGGER.info("Cleaned up tmpdir %s", tmpdir)
 
-    def tcp_delegate(self, host, port):
+    def tcp_delegate(self, host, port, tmpdir):
         """Listen for TCP connections (e.g., Worker registration)."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            q = Queue()
+            self.job_id = 0
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
             LOGGER.debug(f"TCP bind {host}:{port}")
             sock.listen()
             sock.settimeout(1)
 
-            while True:
+            # Start job processor thread
+            job_thread = threading.Thread(target=self.job_processor, args=(q, tmpdir))
+            job_thread.start()
+
+            while not self.shutdown_flag:
+
+                
                 try:
                     clientsocket, address = sock.accept()
                 except socket.timeout:
@@ -57,7 +70,7 @@ class Manager:
                 with clientsocket:
                     clientsocket.settimeout(1)
                     message_chunks = []
-                    while True:
+                    while not self.shutdown_flag:
                         try:
                             data = clientsocket.recv(4096)
                         except socket.timeout:
@@ -104,6 +117,7 @@ class Manager:
 
 
                     elif message_dict.get("message_type") == "shutdown":
+                        self.shutdown_flag = True
                         for worker_host, worker_port in self.workers:
                             shutdown_msg = {"message_type": "shutdown"}
                             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
@@ -116,8 +130,27 @@ class Manager:
 
                         # Exit tcp_delegate → causes Manager to end
                         sys.exit(0)
+
+
+                    elif message_dict.get("message_type") == "new_manager_job":
+                        q.put(message_dict)
+                        # Don't process here - let job_processor thread handle it
+
                         
                                             
+
+    def job_processor(self, q, tmpdir):
+        """Process jobs from queue in separate thread."""
+        while not self.shutdown_flag:
+            try:
+                job = q.get(timeout=1)
+            except:
+                continue
+            
+            self.active_job_indicator = True
+            self.execute_job(job, tmpdir)
+            self.job_id = self.job_id + 1
+            
 
     def udp_delegate(self, host, port):
         """Listen for UDP heartbeat messages."""
@@ -127,7 +160,7 @@ class Manager:
             LOGGER.debug(f"UDP bind {host}:{port}")
             sock.settimeout(1)
 
-            while True:
+            while not self.shutdown_flag:
                 try:
                     message_bytes = sock.recv(4096)
                 except socket.timeout:
@@ -141,6 +174,45 @@ class Manager:
 
                 
                 LOGGER.debug("UDP recv\n%s", json.dumps(message_dict, indent=4))
+
+
+
+    def execute_job(self, job, tmpdir):
+        input_dir = job["input_directory"]
+        output_dir = job["output_directory"]
+        mapper_exe = job["mapper_executable"]
+        reducer_exe = job["reducer_executable"]
+        num_mappers = job["num_mappers"]
+        num_reducers = job["num_reducers"]
+
+
+        if os.path.exists(job["output_directory"]):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        job_dir = os.path.join(tmpdir, f"job-{self.job_id:05d}")
+        os.makedirs(job_dir, exist_ok=True)
+
+
+
+        #handle rest of code
+
+        self.active_job_indicator = False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
