@@ -7,7 +7,10 @@ import click
 import socket
 import threading
 import mapreduce.utils
-
+import hashlib
+import shutil
+import tempfile
+import subprocess
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
@@ -94,10 +97,80 @@ class Worker:
                         heartbeat_thread.daemon = True  # allows clean shutdown
                         heartbeat_thread.start()
 
-                    if message_dict.get("message_type") == "shutdown":
+                    elif message_dict.get("message_type") == "shutdown":
                         self.shutdown_flag.set()
                         LOGGER.info("Shutdown signal received. Exiting Worker.")
-                        return
+                        break
+
+
+                    elif message_dict.get("message_type") == "new_map_task":
+                        task_id = message_dict["task_id"]
+                        input_paths = message_dict["input_paths"]
+                        mapper_exe = message_dict["executable"]
+                        output_directory = message_dict["output_directory"]
+                        num_partitions = message_dict["num_partitions"]
+
+                        LOGGER.info(f"Starting MapTask({task_id}) on inputs {input_paths}")
+
+                        # Temporary directory for intermediate partition files
+                        with tempfile.TemporaryDirectory(prefix=f"mapreduce-local-task{task_id:05d}-") as local_tmp:
+
+                            # Open partition files for writing
+                            partition_files = []
+                            for p in range(num_partitions):
+                                out_path = os.path.join(local_tmp, f"maptask{task_id:05d}-part{p:05d}")
+                                partition_files.append(open(out_path, "w"))
+
+                            # Run mapper on each input file and partition output
+                            for input_path in input_paths:
+                                with open(input_path) as infile:
+                                    with subprocess.Popen(
+                                        [mapper_exe],
+                                        stdin=infile,
+                                        stdout=subprocess.PIPE,
+                                        text=True,
+                                    ) as map_process:
+                                        for line in map_process.stdout:
+                                            # Use partition() instead of split() to handle whitespace correctly
+                                            key, sep, value = line.partition("\t")
+                                            if not sep:  # No tab found
+                                                continue
+                                            
+                                            # Remove trailing newline from value
+                                            value = value.rstrip("\n")
+
+                                            # Hash key → choose reducer partition
+                                            hexdigest = hashlib.md5(key.encode("utf-8")).hexdigest()
+                                            keyhash = int(hexdigest, base=16)
+                                            partition_number = keyhash % num_partitions
+
+                                            # Write to appropriate partition file
+                                            partition_files[partition_number].write(f"{key}\t{value}\n")
+
+                            # Close all partition files
+                            for f in partition_files:
+                                f.close()
+
+                            # Sort and move results into shared Manager directory
+                            for p in range(num_partitions):
+                                filename = os.path.join(local_tmp, f"maptask{task_id:05d}-part{p:05d}")
+                                subprocess.run(["sort", "-o", filename, filename], check=True)
+                                shutil.move(filename, output_directory)
+
+                        # Notify Manager when finished
+                        done_msg = {
+                            "message_type": "finished",
+                            "task_id": task_id,
+                            "worker_host": host,
+                            "worker_port": port
+                        }
+
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.connect((self.manager_host, self.manager_port))
+                            s.sendall(json.dumps(done_msg).encode("utf-8"))
+
+                        LOGGER.info(f"Finished MapTask({task_id}) and notified Manager.")
+
                         
  
     def register_with_manager(self, manager_host, manager_port, host, port):

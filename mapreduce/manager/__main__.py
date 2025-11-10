@@ -173,7 +173,7 @@ class Manager:
                     message_dict = json.loads(message_str)
                 except json.JSONDecodeError:
                     continue
-                if message_str.get("message_type") == "heartbeat":
+                if message_dict.get("message_type") == "heartbeat":
                     wh = message_dict["worker_host"]
                     wp = message_dict["worker_port"]
                     key = (wh, wp)
@@ -194,7 +194,7 @@ class Manager:
         num_reducers = job["num_reducers"]
 
 
-        if os.path.exists(job["output_directory"]):
+        if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
 
