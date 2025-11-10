@@ -11,6 +11,9 @@ import sys
 from queue import Queue
 import shutil
 import time
+from collections import deque
+import time
+from pathlib import Path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -138,6 +141,26 @@ class Manager:
                         q.put(message_dict)
                         # Don't process here - let job_processor thread handle it
 
+                    elif message_dict.get("message_type") == "finished":
+                        worker_host = message_dict["worker_host"]
+                        worker_port = message_dict["worker_port"]
+                        key = (worker_host, worker_port)
+
+                        # Mark worker ready
+                        self.workers[key]["state"] = "ready"
+
+                        # Remove the task from in-progress
+                        task_id = self.in_progress.pop(key, None)
+
+                        # Decrement remaining maps
+                        self.remaining_maps -= 1
+                        LOGGER.info(f"MapTask({task_id}) finished. Remaining maps: {self.remaining_maps}")
+
+                        # If there are still pending tasks, assign next one
+                        if self.pending_map_tasks:
+                            self._assign_map_task_to_worker(key)
+
+
                         
                                             
 
@@ -217,7 +240,7 @@ class Manager:
 
 
 
-        from collections import deque
+        
 
         self.pending_map_tasks = deque(range(num_mappers))   
         self.in_progress = {}                               
@@ -231,13 +254,77 @@ class Manager:
             if w["state"] == "ready":
                 self._assign_map_task_to_worker(key)
 
+        
+
+        
+        while self.remaining_maps > 0 and not self.shutdown_flag:
+            time.sleep(0.1)
+
+
+
+        
+
+
+        job_path = Path(self.job_dir)
+
+        # Build list of reduce tasks
+        reduce_tasks = []
+        for partition_id in range(self.num_reducers):
+            pattern = f"maptask*-part{partition_id:05d}"
+            input_paths = sorted(str(p) for p in job_path.glob(pattern))
+
+            reduce_tasks.append((partition_id, input_paths))
+
+        # Assign reduce tasks to workers in registration order
+        self.pending_reduce_tasks = deque(range(self.num_reducers))
+        self.reduce_partitions = {pid: paths for pid, paths in reduce_tasks}
+        self.in_progress_reduce = {}
+        self.remaining_reduces = self.num_reducers
+        self.reducer_exe = reducer_exe
+        self.output_dir = output_dir
+
+        for key, w in self.workers.items():
+            if w["state"] == "ready":
+                self._assign_reduce_task_to_worker(key)
 
 
 
 
-        #handle rest of code
+        
 
         self.active_job_indicator = False
+
+
+
+
+    def _assign_reduce_task_to_worker(self, key):
+
+        if not self.pending_reduce_tasks:
+            return
+
+        task_id = self.pending_reduce_tasks.popleft()
+        wh, wp = key
+
+        message = {
+            "message_type": "new_reduce_task",
+            "task_id": task_id,
+            "input_paths": self.reduce_partitions[task_id],
+            "executable": self.reducer_exe,
+            "output_directory": self.output_dir,
+        }
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((wh, wp))
+                s.sendall(json.dumps(message).encode("utf-8"))
+            self.workers[key]["state"] = "busy"
+            self.in_progress_reduce[key] = task_id
+            LOGGER.info(f"Assigned ReduceTask({task_id}) → Worker({wh},{wp})")
+        except OSError:
+            LOGGER.warning(f"Worker {key} unreachable during reduce, marking dead.")
+            self.workers[key]["state"] = "dead"
+            self.pending_reduce_tasks.appendleft(task_id)
+
 
 
 
@@ -273,7 +360,7 @@ class Manager:
 
 
     def dead_worker_monitor(self):
-        import time
+        
         TIMEOUT = 6
         while not self.shutdown_flag:
             now = time.time()

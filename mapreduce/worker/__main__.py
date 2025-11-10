@@ -11,6 +11,9 @@ import hashlib
 import shutil
 import tempfile
 import subprocess
+import heapq
+from contextlib import ExitStack
+
 
 # Configure logging
 LOGGER = logging.getLogger(__name__)
@@ -170,6 +173,64 @@ class Worker:
                             s.sendall(json.dumps(done_msg).encode("utf-8"))
 
                         LOGGER.info(f"Finished MapTask({task_id}) and notified Manager.")
+                    
+                    elif message_dict.get("message_type") == "new_reduce_task":
+                        task_id = message_dict["task_id"]
+                        input_paths = message_dict["input_paths"]
+                        reducer_exe = message_dict["executable"]
+                        output_directory = message_dict["output_directory"]
+
+                        LOGGER.info(f"Starting ReduceTask({task_id}) with inputs {input_paths}")
+
+                        # Temporary directory for reduce output
+                        with tempfile.TemporaryDirectory(prefix=f"mapreduce-local-task{task_id:05d}-") as local_tmp:
+
+                            # Merge inputs lazily using heapq.merge
+                            # Open all input files at once using ExitStack
+                            
+                            with ExitStack() as stack:
+                                file_handles = [stack.enter_context(open(path)) for path in input_paths]
+
+                                # Each line is "key\tvalue\n"; heapq.merge preserves lexicographic order → correct
+                                merged_stream = heapq.merge(*file_handles)
+
+                                # Prepare output file path
+                                output_filename = f"part-{task_id:05d}"
+                                output_tmp_path = os.path.join(local_tmp, output_filename)
+
+                                with open(output_tmp_path, "w") as outfile:
+                                    # Launch reducer process
+                                    with subprocess.Popen(
+                                        [reducer_exe],
+                                        text=True,
+                                        stdin=subprocess.PIPE,
+                                        stdout=outfile,
+                                    ) as reduce_process:
+
+                                        # Stream merged input into reducer
+                                        for line in merged_stream:
+                                            reduce_process.stdin.write(line)
+
+                                    # The `with` block ensures reducer exits cleanly
+
+                            # Move final output into job's output directory
+                            shutil.move(output_tmp_path, output_directory)
+
+                        # Notify Manager that reducer finished
+                        done_msg = {
+                            "message_type": "finished",
+                            "task_id": task_id,
+                            "worker_host": host,
+                            "worker_port": port
+                        }
+
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                            s.connect((self.manager_host, self.manager_port))
+                            s.sendall(json.dumps(done_msg).encode("utf-8"))
+
+                        LOGGER.info(f"Finished ReduceTask({task_id}) → notified Manager.")
+
+
 
                         
  
