@@ -90,7 +90,7 @@ class Worker:
                         LOGGER.info(f"Connected to Manager {self.manager_host}:{self.manager_port}")    
                         heartbeat_thread = threading.Thread(
                             target=self.send_heartbeats,
-                            args=(self.manager_host, self.manager_port, host, port)
+                            args=(self.manager_host, self.manager_port, host, port), daemon=True
                         )
                         LOGGER.info("Start heartbeat thread")
 
