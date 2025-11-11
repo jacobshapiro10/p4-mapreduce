@@ -109,50 +109,54 @@ class Worker:
         LOGGER.info("Finished MapTask(%s) and notified Manager.", task_id)
 
     def _run_map_task(self,
-                      task_id,
-                      mapper,
-                      input_files,
-                      output_dir,
-                      num_partitions):
-        """Run the mapper over input_files and produce partition files.
-
-        fixes style.
-        """
+                  task_id,
+                  mapper,
+                  input_files,
+                  output_dir,
+                  num_partitions):
+        """Run the mapper over input_files and produce partition files."""
         prefix = f"mapreduce-local-task{task_id:05d}-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
-            # Prepare partition file paths
-            part_paths = [
-                os.path.join(tmp, f"maptask{task_id:05d}-part{p:05d}")
-                for p in range(num_partitions)
+            part_paths = self._create_partition_files(tmp, task_id, num_partitions)
+            self._process_mapper_output(mapper, input_files, part_paths, num_partitions)
+            self._sort_and_move(part_paths, output_dir)
+
+    def _create_partition_files(self, tmp_dir, task_id, num_partitions):
+        """Create empty partition files and return their paths."""
+        part_paths = [
+            os.path.join(tmp_dir, f"maptask{task_id:05d}-part{p:05d}")
+            for p in range(num_partitions)
+        ]
+        for fpath in part_paths:
+            with open(fpath, "w", encoding="utf-8"):
+                pass
+        return part_paths
+
+    def _process_mapper_output(self, mapper, input_files, part_paths, num_partitions):
+        """Run mapper on inputs and distribute output to partition files."""
+        # Use ExitStack to manage multiple file-contexts instead of manual open/close
+        with ExitStack() as stack:
+            part_files = [
+                stack.enter_context(open(pp, "w", encoding="utf-8"))
+                for pp in part_paths
             ]
 
-            # Ensure files exist
-            for fpath in part_paths:
-                with open(fpath, "w", encoding="utf-8"):
-                    pass
-
-            # Run mapper on each input and append outputs to partition files
-            # Open partition files once and keep handles while streaming mapper output
-            part_files = [open(pp, "w", encoding="utf-8") for pp in part_paths]
-
             for path in input_files:
-                with open(path, encoding="utf-8") as infile:
-                    with subprocess.Popen(
-                        [mapper], stdin=infile, stdout=subprocess.PIPE, text=True
-                    ) as proc:
-                        for line in proc.stdout:
-                            key, sep, value = line.partition("\t")
-                            if not sep:
-                                continue
-                            hexdigest = hashlib.md5(key.encode()).hexdigest()
-                            part = int(hexdigest, 16) % num_partitions
-                            part_files[part].write(f"{key}\t{value.rstrip()}\n")
+                self._process_single_input(mapper, path, part_files, num_partitions)
 
-            # Close partition files
-            for f in part_files:
-                f.close()
-
-            self._sort_and_move(part_paths, output_dir)
+    def _process_single_input(self, mapper, input_path, part_files, num_partitions):
+        """Process a single input file through the mapper."""
+        with open(input_path, encoding="utf-8") as infile:
+            with subprocess.Popen(
+                [mapper], stdin=infile, stdout=subprocess.PIPE, text=True
+            ) as proc:
+                for line in proc.stdout:
+                    key, sep, value = line.partition("\t")
+                    if not sep:
+                        continue
+                    hexdigest = hashlib.md5(key.encode()).hexdigest()
+                    part = int(hexdigest, 16) % num_partitions
+                    part_files[part].write(f"{key}\t{value.rstrip()}\n")
 
     def _process_map_input(self, mapper, path, part_paths, num_partitions):
         """Run mapper on single input file & append results to partitions."""
