@@ -370,6 +370,7 @@ class Manager:
 
     def _gather_reduce_partitions(self, job_dir, num_reducers):
         """Return reduce partition mapping for a finished map phase.
+        
         for style points.
         """
         job_path = Path(job_dir)
@@ -391,15 +392,15 @@ def main(host, port, logfile, loglevel, shared_dir):
     """Run Manager."""
     tempfile.tempdir = shared_dir
     if logfile:
-        handler = logging.FileHandler(logfile)
+        log_handler = logging.FileHandler(logfile)
     else:
-        handler = logging.StreamHandler()
+        log_handler = logging.StreamHandler()
     formatter = logging.Formatter(
         f"Manager:{port} [%(levelname)s] %(message)s"
     )
-    handler.setFormatter(formatter)
+    log_handler.setFormatter(formatter)
     root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
+    root_logger.addHandler(log_handler)
     root_logger.setLevel(loglevel.upper())
     Manager(host, port)
 

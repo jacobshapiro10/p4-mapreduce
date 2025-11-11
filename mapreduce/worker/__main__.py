@@ -106,6 +106,7 @@ class Worker:
 
     def _run_map_task(self, task_id, mapper, input_files, output_dir, num_partitions):
         """Run the mapper over input_files and produce partition files.
+        
         fixes style.
         """
         prefix = f"mapreduce-local-task{task_id:05d}-"
