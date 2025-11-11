@@ -75,35 +75,3 @@ files_for_autograder_io/
 # Google Drive and Dropbox
 Icon
 .dropbox*
-
-
-
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
-env/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Build/distribution files
-*.egg-info/
-*.tar.gz
-
-# Secrets / keys
-*.pem
-
-# Logs
-*.log
-
-# VS Code / editor files
-.vscode/
-.idea/
-
-# environment variables
-env
-venv/
-**env/**
-**venv/**
