@@ -98,46 +98,60 @@ class Worker:
 
         LOGGER.info("Starting MapTask(%s) on inputs %s", task_id, input_files)
 
-        prefix = f"mapreduce-local-task{task_id:05d}-"
-        with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
-            part_files = [
-                open(
-                    os.path.join(
-                        tmp,
-                        f"maptask{task_id:05d}-part{p:05d}"),
-                    "w",
-                    encoding='utf-8')
-                for p in range(num_partitions)
-            ]
-
-            for path in input_files:
-                with open(path, encoding='utf-8') as infile:
-                    with subprocess.Popen(
-                        [mapper],
-                        stdin=infile,
-                        stdout=subprocess.PIPE,
-                        text=True
-                    ) as proc:
-                        for line in proc.stdout:
-                            key, sep, value = line.partition("\t")
-                            if sep:
-                                hexdigest = hashlib.md5(
-                                    key.encode()).hexdigest()
-                                part = int(hexdigest, 16) % num_partitions
-                                part_files[part].write(
-                                    f"{key}\t{value.rstrip()}\n")
-
-            for f in part_files:
-                f.close()
-
-            for p in range(num_partitions):
-                fname = f"maptask{task_id:05d}-part{p:05d}"
-                fpath = os.path.join(tmp, fname)
-                subprocess.run(["sort", "-o", fpath, fpath], check=True)
-                shutil.move(fpath, output_dir)
+        # Delegate heavy lifting to helper to keep this function small
+        self._run_map_task(task_id, mapper, input_files, output_dir, num_partitions)
 
         self._notify_finished(task_id, host, port)
         LOGGER.info("Finished MapTask(%s) and notified Manager.", task_id)
+
+    def _run_map_task(self, task_id, mapper, input_files, output_dir, num_partitions):
+        """Run the mapper over input_files and produce partition files.
+        fixes style.
+        """
+        prefix = f"mapreduce-local-task{task_id:05d}-"
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
+            # Prepare partition file paths
+            part_paths = [
+                os.path.join(tmp, f"maptask{task_id:05d}-part{p:05d}")
+                for p in range(num_partitions)
+            ]
+
+            # Ensure files exist
+            for fpath in part_paths:
+                with open(fpath, "w", encoding="utf-8"):
+                    pass
+
+            # Run mapper on each input and append outputs to partition files
+            for path in input_files:
+                self._process_map_input(mapper, path, part_paths, num_partitions)
+
+            # Sort and move partition files to output
+            self._sort_and_move(part_paths, output_dir)
+
+    def _process_map_input(self, mapper, path, part_paths, num_partitions):
+        """Run mapper on a single input file and append results to partitions."""
+        with open(path, encoding="utf-8") as infile:
+            cp = subprocess.run(
+                [mapper],
+                stdin=infile,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for line in cp.stdout.splitlines():
+                key, sep, value = line.partition("\t")
+                if not sep:
+                    continue
+                hexdigest = hashlib.md5(key.encode()).hexdigest()
+                part = int(hexdigest, 16) % num_partitions
+                with open(part_paths[part], "a", encoding="utf-8") as pf:
+                    pf.write(f"{key}\t{value.rstrip()}\n")
+
+    def _sort_and_move(self, part_paths, output_dir):
+        """Sort partition files in-place and move them to the output directory."""
+        for fpath in part_paths:
+            subprocess.run(["sort", "-o", fpath, fpath], check=True)
+            shutil.move(fpath, output_dir)
 
     def _handle_shutdown(self):
         """Handle shutdown message."""
@@ -189,31 +203,30 @@ class Worker:
             task_id,
             input_files)
 
+        LOGGER.info("Starting ReduceTask helper for %s", task_id)
+        self._run_reduce_task(task_id, reducer, input_files, output_dir)
+
+        self._notify_finished(task_id, host, port)
+        LOGGER.info("Finished ReduceTask(%s) and notified Manager.", task_id)
+
+    def _run_reduce_task(self, task_id, reducer, input_files, output_dir):
+        """Run the reducer over merged input files and write output."""
         prefix = f"mapreduce-local-task{task_id:05d}-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
             out_path = os.path.join(tmp, f"part-{task_id:05d}")
 
             with ExitStack() as stack:
-                inputs = [
-                    stack.enter_context(open(p, encoding='utf-8'))
-                    for p in input_files
-                ]
+                inputs = [stack.enter_context(open(p, encoding="utf-8")) for p in input_files]
                 merged = heapq.merge(*inputs)
 
-                with open(out_path, "w", encoding='utf-8') as out:
+                with open(out_path, "w", encoding="utf-8") as out:
                     with subprocess.Popen(
-                        [reducer],
-                        stdin=subprocess.PIPE,
-                        stdout=out,
-                        text=True
+                        [reducer], stdin=subprocess.PIPE, stdout=out, text=True
                     ) as proc:
                         for line in merged:
                             proc.stdin.write(line)
 
             shutil.move(out_path, output_dir)
-
-        self._notify_finished(task_id, host, port)
-        LOGGER.info("Finished ReduceTask(%s) and notified Manager.", task_id)
 
     def register_with_manager(self, manager_host, manager_port, host, port):
         """Send a registration message to the Manager via TCP."""
