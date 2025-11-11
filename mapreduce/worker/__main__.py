@@ -1,18 +1,16 @@
 """MapReduce framework Worker node."""
-import os
-import logging
-import json
-import time
-import click
-import socket
-import threading
-import mapreduce.utils
 import hashlib
-import shutil
-import tempfile
-import subprocess
 import heapq
+import json
+import logging
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
 from contextlib import ExitStack
+import click
 
 
 # Configure logging
@@ -23,6 +21,7 @@ class Worker:
     """A class representing a Worker node in a MapReduce cluster."""
 
     def __init__(self, host, port, m_host, m_port):
+        """Initialize worker with host/port and start listening threads."""
         self.m_host = m_host
         self.m_port = m_port
         self.shutdown_flag = threading.Event()
@@ -30,7 +29,7 @@ class Worker:
 
         LOGGER.info
         ("Worker host=%s port=%s manager_host=%s, manager_port=%s pwd=%s",
-         host, port, m_host, m_port, os.getcwd())
+            host, port, m_host, m_port, os.getcwd())
         listen_thread = threading.Thread(target=self.listen_for_messages,
                                          args=(host, port))
         listen_thread.daemon = True
@@ -44,7 +43,7 @@ class Worker:
         LOGGER.info("Start TCP server thread")
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
-        LOGGER.debug(f"TCP bind {host}:{port}")
+        LOGGER.debug("TCP bind %s:%s", host, port)
         sock.listen()
         sock.settimeout(1)
 
@@ -83,7 +82,6 @@ class Worker:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((self.m_host, self.m_port))
             s.sendall(json.dumps(msg).encode("utf-8"))
-        LOGGER.info(f"Finished task {task_id} and notified Manager.")
 
     def _handle_new_map_task(self, msg, host, port):
         task_id = msg["task_id"]
@@ -128,7 +126,7 @@ class Worker:
 
     def _handle_register_ack(self, host, port):
         LOGGER.debug("Got register_ack RegisterAckMessage()")
-        LOGGER.info(f"Connected to Manager {self.m_host}:{self.m_port}")
+        LOGGER.info(f"Connected to Manager %s:%s", self.m_host, self.m_port)
         self.hb_t = threading.Thread(
             target=self.send_heartbeats,
             args=(self.m_host, self.m_port, host, port),
@@ -167,7 +165,9 @@ class Worker:
                 merged = heapq.merge(*files)
 
                 out_file = os.path.join(tmp, f"part-{task_id:05d}")
-                with open(out_file, "w") as out, subprocess.Popen(
+                with open(
+                    out_file, "w", encoding='utf-8'
+                    ) as out, subprocess.Popen(
                     [reducer_exe], text=True, stdin=subprocess.PIPE, stdout=out
                 ) as proc:
                     for line in merged:
@@ -194,12 +194,10 @@ class Worker:
                 "worker_host": host,
                 "worker_port": port,
             }
-            LOGGER.debug(f"TCP send to {m_host}:{m_port}\n%s",
-                         json.dumps(message_dict, indent=4))
 
             sock.sendall(json.dumps(message_dict).encode("utf-8"))
             LOGGER.info(
-                f"Sent connection request to Manager {m_host}:{m_port}"
+                f"Sent connection request to Manager %s:%s", m_host, m_port
             )
 
     def send_heartbeats(self, m_host, m_port, host, port):
@@ -218,10 +216,6 @@ class Worker:
                 except OSError:
                     # Manager might be down — just try again later
                     continue
-                LOGGER.debug(
-                    f"UDP sent to {m_host}:{m_port}\n%s",
-                    json.dumps(message, indent=4)
-                    )
 
                 self.shutdown_flag.wait(2)
 
