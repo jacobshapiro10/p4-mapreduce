@@ -23,23 +23,16 @@ class Manager:
 
     def __init__(self, host, port):
         """Init everythign."""
+        # Core manager state
         self.active_job_indicator = False
         self.shutdown_flag = False
         self.workers = {}
         self.job_id = 0
-        self.pending_mt = None
-        self.in_progress = {}
-        self.r_maps = 0
-        self.partitions = []
-        self.job_dir = ""
-        self.mapper_exe = ""
-        self.num_reducers = 0
-        self.prt = None
-        self.reduce_partitions = {}
-        self.ipr = {}
-        self.r_reduces = 0
-        self.reducer_exe = ""
-        self.output_dir = ""
+        # Group per-job state to reduce number of top-level attributes
+        # This holds keys like: pending_mt, in_progress, r_maps, partitions,
+        # job_dir, mapper_exe, num_reducers, prt, reduce_partitions, ipr,
+        # r_reduces, reducer_exe, output_dir
+        self.current_job = None
         LOGGER.info("Manager host=%s port=%s pwd=%s", host, port, os.getcwd())
         prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
@@ -149,15 +142,17 @@ class Manager:
 
             self.workers[key]["state"] = "ready"
 
-            if key in self.in_progress:
-                self.in_progress.pop(key, None)
-                self.r_maps -= 1
-                if self.pending_mt:
+            # Update per-job state if a job is active
+            cj = self.current_job
+            if cj and key in cj.get("in_progress", {}):
+                cj["in_progress"].pop(key, None)
+                cj["r_maps"] -= 1
+                if cj.get("pending_mt"):
                     self._assign_map_task_to_worker(key)
-            elif key in self.ipr:
-                self.ipr.pop(key, None)
-                self.r_reduces -= 1
-                if self.prt:
+            elif cj and key in cj.get("ipr", {}):
+                cj["ipr"].pop(key, None)
+                cj["r_reduces"] -= 1
+                if cj.get("prt"):
                     self._assign_reduce_task_to_worker(key)
 
     def jp(self, q, tmpdir):
@@ -202,68 +197,93 @@ class Manager:
 
     def execute_job(self, job, tmpdir):
         """Execute the job."""
+        # Unpack job fields
         input_dir = job["input_directory"]
         output_dir = job["output_directory"]
-        mapper_exe = job["mapper_executable"]
-        reducer_exe = job["reducer_executable"]
         nm = job["num_mappers"]
-        num_reducers = job["num_reducers"]
+
+        # Prepare output and job directory
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         job_dir = os.path.join(tmpdir, f"job-{self.job_id:05d}")
         os.makedirs(job_dir, exist_ok=True)
-        files = os.listdir(input_dir)
-        files = sorted(files)
+
+        # Create partitions for mappers
+        files = sorted(os.listdir(input_dir))
         partitions = [[] for _ in range(nm)]
         for idx, filename in enumerate(files):
             partitions[idx % nm].append(os.path.join(input_dir, filename))
-        self.pending_mt = deque(range(nm))
-        self.in_progress = {}
-        self.r_maps = nm
-        self.partitions = partitions
-        self.job_dir = job_dir
-        self.mapper_exe = mapper_exe
-        self.num_reducers = num_reducers
+
+        # Group per-job state in a single dict to keep instance attributes small
+        job_state = {
+            "pending_mt": deque(range(nm)),
+            "in_progress": {},
+            "r_maps": nm,
+            "partitions": partitions,
+            "job_dir": job_dir,
+            "mapper_exe": job["mapper_executable"],
+            "num_reducers": job["num_reducers"],
+            # reduce-time fields (filled after maps finish)
+            "prt": None,
+            "reduce_partitions": {},
+            "ipr": {},
+            "r_reduces": 0,
+            "reducer_exe": job["reducer_executable"],
+            "output_dir": output_dir,
+        }
+
+        self.current_job = job_state
+
+        # Kick off map tasks
         for key, w in self.workers.items():
             if w["state"] == "ready":
                 self._assign_map_task_to_worker(key)
-        while self.r_maps > 0 and not self.shutdown_flag:
+
+        # Wait for maps to finish
+        while self.current_job and self.current_job["r_maps"] > 0 and not self.shutdown_flag:
             time.sleep(0.1)
-        job_path = Path(self.job_dir)
-        reduce_tasks = []
-        for partition_id in range(self.num_reducers):
-            pattern = f"maptask*-part{partition_id:05d}"
-            input_paths = sorted(str(p) for p in job_path.glob(pattern))
-            reduce_tasks.append((partition_id, input_paths))
-        self.prt = deque(range(self.num_reducers))
-        self.reduce_partitions = dict(reduce_tasks)
-        self.ipr = {}
-        self.r_reduces = self.num_reducers
-        self.reducer_exe = reducer_exe
-        self.output_dir = output_dir
+
+        # Prepare reduce tasks
+        rp = self._gather_reduce_partitions(self.current_job["job_dir"],
+                                           self.current_job["num_reducers"])
+
+        self.current_job["prt"] = deque(range(self.current_job["num_reducers"]))
+        self.current_job["reduce_partitions"] = rp
+        self.current_job["ipr"] = {}
+        self.current_job["r_reduces"] = self.current_job["num_reducers"]
+
+        # Kick off reduce tasks
         for key, w in self.workers.items():
             if w["state"] == "ready":
                 self._assign_reduce_task_to_worker(key)
-        while self.r_reduces > 0 and not self.shutdown_flag:
+
+        # Wait for reduces to finish
+        while self.current_job and self.current_job["r_reduces"] > 0 and not self.shutdown_flag:
             time.sleep(0.1)
-        shutil.rmtree(self.job_dir)
+
+        # Clean up
+        try:
+            shutil.rmtree(self.current_job["job_dir"])
+        except OSError:
+            pass
+        self.current_job = None
         self.active_job_indicator = False
 
     def _assign_reduce_task_to_worker(self, key):
-
-        if not self.prt:
+        cj = self.current_job
+        if not cj or not cj.get("prt"):
             return
 
-        task_id = self.prt.popleft()
+        task_id = cj["prt"].popleft()
         wh, wp = key
 
         message = {
             "message_type": "new_reduce_task",
             "task_id": task_id,
-            "input_paths": self.reduce_partitions[task_id],
-            "executable": self.reducer_exe,
-            "output_directory": self.output_dir,
+            "input_paths": cj["reduce_partitions"][task_id],
+            "executable": cj["reducer_exe"],
+            "output_directory": cj["output_dir"],
         }
 
         try:
@@ -271,24 +291,25 @@ class Manager:
                 s.connect((wh, wp))
                 s.sendall(json.dumps(message).encode("utf-8"))
             self.workers[key]["state"] = "busy"
-            self.ipr[key] = task_id
+            cj["ipr"][key] = task_id
         except OSError:
             self.workers[key]["state"] = "dead"
-            self.prt.appendleft(task_id)
+            cj["prt"].appendleft(task_id)
 
     def _assign_map_task_to_worker(self, key):
-        if not self.pending_mt:
+        cj = self.current_job
+        if not cj or not cj.get("pending_mt"):
             return
-        task_id = self.pending_mt.popleft()
+        task_id = cj["pending_mt"].popleft()
         wh, wp = key
 
         message = {
             "message_type": "new_map_task",
             "task_id": task_id,
-            "input_paths": self.partitions[task_id],
-            "executable": self.mapper_exe,
-            "output_directory": self.job_dir,
-            "num_partitions": self.num_reducers,
+            "input_paths": cj["partitions"][task_id],
+            "executable": cj["mapper_exe"],
+            "output_directory": cj["job_dir"],
+            "num_partitions": cj["num_reducers"],
         }
 
         try:
@@ -296,10 +317,10 @@ class Manager:
                 s.connect((wh, wp))
                 s.sendall(json.dumps(message).encode("utf-8"))
             self.workers[key]["state"] = "busy"
-            self.in_progress[key] = task_id
+            cj["in_progress"][key] = task_id
         except OSError:
             self.workers[key]["state"] = "dead"
-            self.pending_mt.appendleft(task_id)
+            cj["pending_mt"].appendleft(task_id)
 
     def dwm(self):
         """Detect dead workers and reassign tasks."""
@@ -320,30 +341,44 @@ class Manager:
         worker["state"] = "dead"
 
     def _requeue_map_if_needed(self, key):
-        if key not in self.in_progress:
+        cj = self.current_job
+        if not cj or key not in cj.get("in_progress", {}):
             return
-        task_id = self.in_progress.pop(key)
-        self.pending_mt.appendleft(task_id)
+        task_id = cj["in_progress"].pop(key)
+        cj["pending_mt"].appendleft(task_id)
         self._assign_first_ready_worker_to_map()
 
     def _assign_first_ready_worker_to_map(self):
         for worker_key, w in self.workers.items():
-            if w["state"] == "ready" and self.pending_mt:
+            if w["state"] == "ready" and self.current_job and self.current_job.get("pending_mt"):
                 self._assign_map_task_to_worker(worker_key)
                 return
 
     def _requeue_reduce_if_needed(self, key):
-        if not hasattr(self, "ipr") or key not in self.ipr:
+        cj = self.current_job
+        if not cj or key not in cj.get("ipr", {}):
             return
-        task_id = self.ipr.pop(key)
-        self.prt.appendleft(task_id)
+        task_id = cj["ipr"].pop(key)
+        cj["prt"].appendleft(task_id)
         self._assign_first_ready_worker_to_reduce()
 
     def _assign_first_ready_worker_to_reduce(self):
         for worker_key, w in self.workers.items():
-            if w["state"] == "ready" and self.prt:
+            if w["state"] == "ready" and self.current_job and self.current_job.get("prt"):
                 self._assign_reduce_task_to_worker(worker_key)
                 return
+
+    def _gather_reduce_partitions(self, job_dir, num_reducers):
+        """Return reduce partition mapping for a finished map phase.
+        for style points.
+        """
+        job_path = Path(job_dir)
+        reduce_parts = {}
+        for pid in range(num_reducers):
+            pattern = f"maptask*-part{pid:05d}"
+            input_paths = sorted(str(p) for p in job_path.glob(pattern))
+            reduce_parts[pid] = input_paths
+        return reduce_parts
 
 
 @click.command()
