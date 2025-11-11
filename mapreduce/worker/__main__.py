@@ -132,33 +132,43 @@ class Worker:
                     pass
 
             # Run mapper on each input and append outputs to partition files
-            for path in input_files:
-                self._process_map_input(mapper,
-                                        path,
-                                        part_paths,
-                                        num_partitions)
+            # Open partition files once and keep handles while streaming mapper output
+            part_files = [open(pp, "w", encoding="utf-8") for pp in part_paths]
 
-            # Sort and move partition files to output
+            for path in input_files:
+                with open(path, encoding="utf-8") as infile:
+                    with subprocess.Popen(
+                        [mapper], stdin=infile, stdout=subprocess.PIPE, text=True
+                    ) as proc:
+                        for line in proc.stdout:
+                            key, sep, value = line.partition("\t")
+                            if not sep:
+                                continue
+                            hexdigest = hashlib.md5(key.encode()).hexdigest()
+                            part = int(hexdigest, 16) % num_partitions
+                            part_files[part].write(f"{key}\t{value.rstrip()}\n")
+
+            # Close partition files
+            for f in part_files:
+                f.close()
+
             self._sort_and_move(part_paths, output_dir)
 
     def _process_map_input(self, mapper, path, part_paths, num_partitions):
         """Run mapper on single input file & append results to partitions."""
         with open(path, encoding="utf-8") as infile:
-            cp = subprocess.run(
-                [mapper],
-                stdin=infile,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            for line in cp.stdout.splitlines():
-                key, sep, value = line.partition("\t")
-                if not sep:
-                    continue
-                hexdigest = hashlib.md5(key.encode()).hexdigest()
-                part = int(hexdigest, 16) % num_partitions
-                with open(part_paths[part], "a", encoding="utf-8") as pf:
-                    pf.write(f"{key}\t{value.rstrip()}\n")
+            # Stream mapper output rather than capture it to avoid high memory usage
+            with subprocess.Popen(
+                [mapper], stdin=infile, stdout=subprocess.PIPE, text=True
+            ) as proc:
+                for line in proc.stdout:
+                    key, sep, value = line.partition("\t")
+                    if not sep:
+                        continue
+                    hexdigest = hashlib.md5(key.encode()).hexdigest()
+                    part = int(hexdigest, 16) % num_partitions
+                    with open(part_paths[part], "a", encoding="utf-8") as pf:
+                        pf.write(f"{key}\t{value.rstrip()}\n")
 
     def _sort_and_move(self, part_paths, output_dir):
         """Sort partition files in-place and move them to output directory."""
