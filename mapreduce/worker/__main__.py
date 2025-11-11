@@ -99,14 +99,23 @@ class Worker:
         LOGGER.info("Starting MapTask(%s) on inputs %s", task_id, input_files)
 
         # Delegate heavy lifting to helper to keep this function small
-        self._run_map_task(task_id, mapper, input_files, output_dir, num_partitions)
+        self._run_map_task(task_id,
+                           mapper,
+                           input_files,
+                           output_dir,
+                           num_partitions)
 
         self._notify_finished(task_id, host, port)
         LOGGER.info("Finished MapTask(%s) and notified Manager.", task_id)
 
-    def _run_map_task(self, task_id, mapper, input_files, output_dir, num_partitions):
+    def _run_map_task(self,
+                      task_id,
+                      mapper,
+                      input_files,
+                      output_dir,
+                      num_partitions):
         """Run the mapper over input_files and produce partition files.
-        
+
         fixes style.
         """
         prefix = f"mapreduce-local-task{task_id:05d}-"
@@ -124,13 +133,16 @@ class Worker:
 
             # Run mapper on each input and append outputs to partition files
             for path in input_files:
-                self._process_map_input(mapper, path, part_paths, num_partitions)
+                self._process_map_input(mapper,
+                                        path,
+                                        part_paths,
+                                        num_partitions)
 
             # Sort and move partition files to output
             self._sort_and_move(part_paths, output_dir)
 
     def _process_map_input(self, mapper, path, part_paths, num_partitions):
-        """Run mapper on a single input file and append results to partitions."""
+        """Run mapper on single input file & append results to partitions."""
         with open(path, encoding="utf-8") as infile:
             cp = subprocess.run(
                 [mapper],
@@ -149,7 +161,7 @@ class Worker:
                     pf.write(f"{key}\t{value.rstrip()}\n")
 
     def _sort_and_move(self, part_paths, output_dir):
-        """Sort partition files in-place and move them to the output directory."""
+        """Sort partition files in-place and move them to output directory."""
         for fpath in part_paths:
             subprocess.run(["sort", "-o", fpath, fpath], check=True)
             shutil.move(fpath, output_dir)
@@ -217,7 +229,9 @@ class Worker:
             out_path = os.path.join(tmp, f"part-{task_id:05d}")
 
             with ExitStack() as stack:
-                inputs = [stack.enter_context(open(p, encoding="utf-8")) for p in input_files]
+                inputs = [stack.enter_context(
+                    open(p, encoding="utf-8"))
+                    for p in input_files]
                 merged = heapq.merge(*inputs)
 
                 with open(out_path, "w", encoding="utf-8") as out:

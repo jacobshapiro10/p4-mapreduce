@@ -215,7 +215,7 @@ class Manager:
         for idx, filename in enumerate(files):
             partitions[idx % nm].append(os.path.join(input_dir, filename))
 
-        # Group per-job state in a single dict to keep instance attributes small
+        # Group per-job state in a single dict to keep instance attr. small
         job_state = {
             "pending_mt": deque(range(nm)),
             "in_progress": {},
@@ -241,14 +241,17 @@ class Manager:
                 self._assign_map_task_to_worker(key)
 
         # Wait for maps to finish
-        while self.current_job and self.current_job["r_maps"] > 0 and not self.shutdown_flag:
+        while (self.current_job and self.current_job["r_maps"] > 0
+               and not self.shutdown_flag):
             time.sleep(0.1)
 
         # Prepare reduce tasks
-        rp = self._gather_reduce_partitions(self.current_job["job_dir"],
-                                           self.current_job["num_reducers"])
+        rp = self._gather_reduce_partitions(
+            self.current_job["job_dir"],
+            self.current_job["num_reducers"])
 
-        self.current_job["prt"] = deque(range(self.current_job["num_reducers"]))
+        self.current_job["prt"] = deque(
+            range(self.current_job["num_reducers"]))
         self.current_job["reduce_partitions"] = rp
         self.current_job["ipr"] = {}
         self.current_job["r_reduces"] = self.current_job["num_reducers"]
@@ -259,7 +262,8 @@ class Manager:
                 self._assign_reduce_task_to_worker(key)
 
         # Wait for reduces to finish
-        while self.current_job and self.current_job["r_reduces"] > 0 and not self.shutdown_flag:
+        while (self.current_job and self.current_job["r_reduces"] > 0
+               and not self.shutdown_flag):
             time.sleep(0.1)
 
         # Clean up
@@ -350,7 +354,8 @@ class Manager:
 
     def _assign_first_ready_worker_to_map(self):
         for worker_key, w in self.workers.items():
-            if w["state"] == "ready" and self.current_job and self.current_job.get("pending_mt"):
+            if (w["state"] == "ready" and self.current_job
+                    and self.current_job.get("pending_mt")):
                 self._assign_map_task_to_worker(worker_key)
                 return
 
@@ -364,13 +369,15 @@ class Manager:
 
     def _assign_first_ready_worker_to_reduce(self):
         for worker_key, w in self.workers.items():
-            if w["state"] == "ready" and self.current_job and self.current_job.get("prt"):
+            if (w["state"] == "ready" and
+                    self.current_job and
+                    self.current_job.get("prt")):
                 self._assign_reduce_task_to_worker(worker_key)
                 return
 
     def _gather_reduce_partitions(self, job_dir, num_reducers):
         """Return reduce partition mapping for a finished map phase.
-        
+
         for style points.
         """
         job_path = Path(job_dir)
