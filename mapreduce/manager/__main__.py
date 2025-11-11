@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Empty
 
 import click
 
@@ -26,6 +26,20 @@ class Manager:
         self.active_job_indicator = False
         self.shutdown_flag = False
         self.workers = {}
+        self.job_id = 0
+        self.pending_mt = None
+        self.in_progress = {}
+        self.r_maps = 0
+        self.partitions = []
+        self.job_dir = ""
+        self.mapper_exe = ""
+        self.num_reducers = 0
+        self.prt = None
+        self.reduce_partitions = {}
+        self.ipr = {}
+        self.r_reduces = 0
+        self.reducer_exe = ""
+        self.output_dir = ""
         LOGGER.info("Manager host=%s port=%s pwd=%s", host, port, os.getcwd())
         prefix = "mapreduce-shared-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
@@ -35,8 +49,8 @@ class Manager:
                                           args=(host, port))
             udp_thread.daemon = True
             udp_thread.start()
-            moniter_thread = threading.Thread(target=self.dwm, daemon=True)
-            moniter_thread.start()
+            self.moniter_thread = threading.Thread(target=self.dwm)
+            self.moniter_thread.start()
             LOGGER.info("Start TCP server thread")
             self.tcp_delegate(host, port, tmpdir)
             udp_thread.join()
@@ -49,7 +63,6 @@ class Manager:
             self.job_id = 0
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
-            LOGGER.debug(f"TCP bind {host}:{port}")
             sock.listen()
             sock.settimeout(1)
 
@@ -58,7 +71,7 @@ class Manager:
 
             while not self.shutdown_flag:
                 try:
-                    clientsocket, address = sock.accept()
+                    clientsocket, _address = sock.accept()
                 except socket.timeout:
                     continue
 
@@ -107,7 +120,6 @@ class Manager:
                 except OSError:
                     LOGGER.debug("Failed to contact worker")
 
-            LOGGER.info(f"Registered Worker RemoteWorker('{wh}', {wp})")
             self.workers[(wh, wp)] = {"state": "ready", "last_hb": time.time()}
             return
 
@@ -122,9 +134,8 @@ class Manager:
                     try:
                         reply_sock.connect((wh, wp))
                         reply_sock.sendall(json.dumps(msg).encode("utf-8"))
-                        LOGGER.debug(f"Sent shutdown to {wh}:{wp}")
                     except OSError:
-                        LOGGER.debug(f"Could not contact worker {wh}:{wp}")
+                        LOGGER.debug("Could not contact worker")
             sys.exit(0)
 
         if mtype == "new_manager_job":
@@ -135,7 +146,6 @@ class Manager:
             wh = message_dict["worker_host"]
             wp = message_dict["worker_port"]
             key = (wh, wp)
-            task_id = message_dict["task_id"]
 
             self.workers[key]["state"] = "ready"
 
@@ -153,7 +163,10 @@ class Manager:
     def jp(self, q, tmpdir):
         """Process jobs from queue in separate thread."""
         while not self.shutdown_flag:
-            job = q.get(timeout=1)
+            try:
+                job = q.get(timeout=1)
+            except Empty:
+                continue
             self.active_job_indicator = True
             self.execute_job(job, tmpdir)
             self.job_id = self.job_id + 1
@@ -163,7 +176,6 @@ class Manager:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
-            LOGGER.debug(f"UDP bind {host}:{port}")
             sock.settimeout(1)
 
             while not self.shutdown_flag:
@@ -225,7 +237,7 @@ class Manager:
             input_paths = sorted(str(p) for p in job_path.glob(pattern))
             reduce_tasks.append((partition_id, input_paths))
         self.prt = deque(range(self.num_reducers))
-        self.reduce_partitions = {pid: paths for pid, paths in reduce_tasks}
+        self.reduce_partitions = dict(reduce_tasks)
         self.ipr = {}
         self.r_reduces = self.num_reducers
         self.reducer_exe = reducer_exe
@@ -260,7 +272,6 @@ class Manager:
                 s.sendall(json.dumps(message).encode("utf-8"))
             self.workers[key]["state"] = "busy"
             self.ipr[key] = task_id
-            LOGGER.info(f"Assigned ReduceTask({task_id}) → Worker({wh},{wp})")
         except OSError:
             self.workers[key]["state"] = "dead"
             self.prt.appendleft(task_id)
@@ -286,42 +297,53 @@ class Manager:
                 s.sendall(json.dumps(message).encode("utf-8"))
             self.workers[key]["state"] = "busy"
             self.in_progress[key] = task_id
-            LOGGER.info(f"Assigned MapTask({task_id}) → Worker({wh},{wp})")
         except OSError:
-            LOGGER.warning(f"Worker {key} unreachable, marking dead.")
             self.workers[key]["state"] = "dead"
             self.pending_mt.appendleft(task_id)
 
     def dwm(self):
-        """dwm."""
-        T = 10
+        """Detect dead workers and reassign tasks."""
+        timeout = 10
         while not self.shutdown_flag:
-            n = time.time()
+            now = time.time()
             for key, worker in list(self.workers.items()):
-                if worker["state"] != "dead" and n - worker["last_hb"] > T:
-                    LOGGER.warning(f"Worker {key} is dead")
-                    worker["state"] = "dead"
-                    # If this worker was processing a map task, requeue it
-                    if key in self.in_progress:
-                        task_id = self.in_progress.pop(key)
-                        self.pending_mt.appendleft(task_id)
-                        LOGGER.info(f"Requeued MapTask({task_id})")
-                        # Try to assign to another ready worker
-                        for worker_key, w in self.workers.items():
-                            if w["state"] == "ready" and self.pending_mt:
-                                self._assign_map_task_to_worker(worker_key)
-                                break
-                    # If this worker was processing a reduce task, requeue it
-                    if hasattr(self, 'ipr') and key in self.ipr:
-                        task_id = self.ipr.pop(key)
-                        self.prt.appendleft(task_id)
-                        LOGGER.info(f"Requeued ReduceTask({task_id})")
-                        # Try to assign to another ready worker
-                        for worker_key, w in self.workers.items():
-                            if w["state"] == "ready" and self.prt:
-                                self._assign_reduce_task_to_worker(worker_key)
-                                break
+                if self._is_dead(worker, now, timeout):
+                    self._mark_dead(worker)
+                    self._requeue_map_if_needed(key)
+                    self._requeue_reduce_if_needed(key)
             time.sleep(1)
+
+    def _is_dead(self, worker, now, timeout):
+        return worker["state"] != "dead" and now - worker["last_hb"] > timeout
+
+    def _mark_dead(self, worker):
+        worker["state"] = "dead"
+
+    def _requeue_map_if_needed(self, key):
+        if key not in self.in_progress:
+            return
+        task_id = self.in_progress.pop(key)
+        self.pending_mt.appendleft(task_id)
+        self._assign_first_ready_worker_to_map()
+
+    def _assign_first_ready_worker_to_map(self):
+        for worker_key, w in self.workers.items():
+            if w["state"] == "ready" and self.pending_mt:
+                self._assign_map_task_to_worker(worker_key)
+                return
+
+    def _requeue_reduce_if_needed(self, key):
+        if not hasattr(self, "ipr") or key not in self.ipr:
+            return
+        task_id = self.ipr.pop(key)
+        self.prt.appendleft(task_id)
+        self._assign_first_ready_worker_to_reduce()
+
+    def _assign_first_ready_worker_to_reduce(self):
+        for worker_key, w in self.workers.items():
+            if w["state"] == "ready" and self.prt:
+                self._assign_reduce_task_to_worker(worker_key)
+                return
 
 
 @click.command()
