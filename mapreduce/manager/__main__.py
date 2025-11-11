@@ -43,48 +43,123 @@ class Manager:
 
     def tcp_delegate(self, host, port, tmpdir):
         """Listen for TCP connections (e.g., Worker registration)."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
         q = Queue()
         self.job_id = 0
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, port))
-        LOGGER.debug(f"TCP bind {host}:{port}")
-        sock.listen()
-        sock.settimeout(1)
 
-        # Start job processor thread
-        threading.Thread(target=self.jp, args=(q, tmpdir), daemon=True).start()
+        # IMPORTANT: context manager → matches test mocking behavior
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            LOGGER.debug(f"TCP bind {host}:{port}")
+            sock.listen()
+            sock.settimeout(1)
 
-        while not self.shutdown_flag:
-            conn = self._accept_client(sock)
-            if not conn:
-                continue
+            # Start job processor thread
+            job_thread = threading.Thread(target=self.jp, args=(q, tmpdir), daemon=True)
+            job_thread.start()
 
-            msg = self._recv_json(conn)
-            conn.close()
-            if not msg:
-                continue
+            
 
-            LOGGER.debug("TCP recv\n%s", json.dumps(msg, indent=4))
-            mtype = msg.get("message_type")
+            while not self.shutdown_flag:
+                # Accept incoming manager-submit / worker messages
+                try:
+                    clientsocket, address = sock.accept()
+                except socket.timeout:
+                    continue
 
-            if mtype == "register":
-                self._handle_register(msg)
-                continue
+                with clientsocket:
+                    clientsocket.settimeout(1)
+                    message_chunks = []
 
-            if mtype == "shutdown":
-                self._handle_shutdown()
-                break
+                    # Receive a full JSON message
+                    while not self.shutdown_flag:
+                        try:
+                            data = clientsocket.recv(4096)
+                        except socket.timeout:
+                            continue
+                        if not data:
+                            break
+                        message_chunks.append(data)
 
-            if mtype == "new_manager_job":
-                q.put(msg)
-                continue
+                    if not message_chunks:
+                        continue
 
-            if mtype == "finished":
-                self._handle_finished(msg)
-                continue
+                    message_bytes = b"".join(message_chunks)
+                    try:
+                        message_dict = json.loads(message_bytes.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        continue
 
-        sock.close()
+                    LOGGER.debug("TCP recv\n%s", json.dumps(message_dict, indent=4))
+                    mtype = message_dict.get("message_type")
+
+                    # -------- REGISTER WORKER --------
+                    if mtype == "register":
+                        wh = message_dict["worker_host"]
+                        wp = message_dict["worker_port"]
+
+                        ack = {"message_type": "register_ack"}
+                        try:
+                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
+                                reply_sock.connect((wh, wp))
+                                reply_sock.sendall(json.dumps(ack).encode("utf-8"))
+                                LOGGER.debug(f"TCP send to {wh}:{wp}")
+                        except OSError:
+                            LOGGER.debug(f"Could not contact worker {wh}:{wp}")
+
+                        self.workers[(wh, wp)] = {"state": "ready", "last_hb": time.time()}
+                        LOGGER.info(f"Registered Worker RemoteWorker('{wh}', {wp})")
+                        continue
+
+                    # -------- SHUTDOWN --------
+                    if mtype == "shutdown":
+                        self.shutdown_flag = True
+
+                        for (wh, wp), worker_info in self.workers.items():
+                            if worker_info["state"] == "dead":
+                                continue
+                            shutdown_msg = {"message_type": "shutdown"}
+                            try:
+                                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reply_sock:
+                                    reply_sock.connect((wh, wp))
+                                    reply_sock.sendall(json.dumps(shutdown_msg).encode("utf-8"))
+                                    LOGGER.debug(f"Sent shutdown to {wh}:{wp}")
+                            except OSError:
+                                LOGGER.debug(f"Could not contact worker {wh}:{wp}")
+
+                        sys.exit(0)
+
+                    # -------- NEW JOB FROM SUBMIT --------
+                    if mtype == "new_manager_job":
+                        q.put(message_dict)
+                        continue
+
+                    # -------- TASK FINISHED (MAP OR REDUCE) --------
+                    if mtype == "finished":
+                        wh = message_dict["worker_host"]
+                        wp = message_dict["worker_port"]
+                        key = (wh, wp)
+                        task_id = message_dict["task_id"]
+
+                        self.workers[key]["state"] = "ready"
+
+                        # Map task finished
+                        if key in self.in_progress:
+                            self.in_progress.pop(key, None)
+                            self.r_maps -= 1
+                            if self.pending_mt:
+                                self._assign_map_task_to_worker(key)
+                            continue
+
+                        # Reduce task finished
+                        if key in self.ipr:
+                            self.ipr.pop(key, None)
+                            self.r_reduces -= 1
+                            if self.prt:
+                                self._assign_reduce_task_to_worker(key)
+                            continue
+
 
     def _accept_client(self, sock):
         """Accept a TCP client, or return None on timeout."""
