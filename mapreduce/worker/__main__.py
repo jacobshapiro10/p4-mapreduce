@@ -109,16 +109,21 @@ class Worker:
         LOGGER.info("Finished MapTask(%s) and notified Manager.", task_id)
 
     def _run_map_task(self,
-                  task_id,
-                  mapper,
-                  input_files,
-                  output_dir,
-                  num_partitions):
+                      task_id,
+                      mapper,
+                      input_files,
+                      output_dir,
+                      num_partitions):
         """Run the mapper over input_files and produce partition files."""
         prefix = f"mapreduce-local-task{task_id:05d}-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
-            part_paths = self._create_partition_files(tmp, task_id, num_partitions)
-            self._process_mapper_output(mapper, input_files, part_paths, num_partitions)
+            part_paths = self._create_partition_files(tmp,
+                                                      task_id,
+                                                      num_partitions)
+            self._process_mapper_output(mapper,
+                                        input_files,
+                                        part_paths,
+                                        num_partitions)
             self._sort_and_move(part_paths, output_dir)
 
     def _create_partition_files(self, tmp_dir, task_id, num_partitions):
@@ -132,9 +137,14 @@ class Worker:
                 pass
         return part_paths
 
-    def _process_mapper_output(self, mapper, input_files, part_paths, num_partitions):
+    def _process_mapper_output(self,
+                               mapper,
+                               input_files,
+                               part_paths,
+                               num_partitions):
         """Run mapper on inputs and distribute output to partition files."""
-        # Use ExitStack to manage multiple file-contexts instead of manual open/close
+        # Use ExitStack to manage multiple file-contexts
+        # instead of manual open/close
         with ExitStack() as stack:
             part_files = [
                 stack.enter_context(open(pp, "w", encoding="utf-8"))
@@ -142,9 +152,16 @@ class Worker:
             ]
 
             for path in input_files:
-                self._process_single_input(mapper, path, part_files, num_partitions)
+                self._process_single_input(mapper,
+                                           path,
+                                           part_files,
+                                           num_partitions)
 
-    def _process_single_input(self, mapper, input_path, part_files, num_partitions):
+    def _process_single_input(self,
+                              mapper,
+                              input_path,
+                              part_files,
+                              num_partitions):
         """Process a single input file through the mapper."""
         with open(input_path, encoding="utf-8") as infile:
             with subprocess.Popen(
@@ -161,7 +178,8 @@ class Worker:
     def _process_map_input(self, mapper, path, part_paths, num_partitions):
         """Run mapper on single input file & append results to partitions."""
         with open(path, encoding="utf-8") as infile:
-            # Stream mapper output rather than capture it to avoid high memory usage
+            # Stream mapper output rather than capture
+            # it to avoid high memory usage
             with subprocess.Popen(
                 [mapper], stdin=infile, stdout=subprocess.PIPE, text=True
             ) as proc:
